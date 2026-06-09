@@ -12,14 +12,44 @@ const PEDESTRIAN_HIGHWAYS = new Set([
   'crossing',
 ])
 
-function isPedestrianWay(tags = {}) {
+const ROAD_HIGHWAYS = new Set([
+  'residential',
+  'unclassified',
+  'tertiary',
+  'secondary',
+  'primary',
+  'living_street',
+  'service',
+  'tertiary_link',
+  'secondary_link',
+  'primary_link',
+])
+
+export const NETWORK_MODES = {
+  CROSSWALK: 'crosswalk',
+  PEDESTRIAN_ONLY: 'pedestrian-only',
+}
+
+function isRoadHighway(highway) {
+  return ROAD_HIGHWAYS.has(highway)
+}
+
+function isPedestrianWay(tags = {}, mode = NETWORK_MODES.CROSSWALK) {
+  const highway = tags.highway
+  if (!highway) return false
+
+  if (mode === NETWORK_MODES.PEDESTRIAN_ONLY) {
+    if (isRoadHighway(highway)) return true
+    if (tags.footway === 'sidewalk' || tags.footway === 'crossing') return true
+    if (PEDESTRIAN_HIGHWAYS.has(highway)) return true
+    if (highway === 'path') return true
+    return false
+  }
+
   if (tags.foot === 'no' || tags.access === 'private') return false
   if (tags.bicycle === 'designated' && tags.foot !== 'yes' && tags.highway !== 'footway') {
     return false
   }
-
-  const highway = tags.highway
-  if (!highway) return false
 
   if (highway === 'footway' || highway === 'pedestrian' || highway === 'steps') return true
   if (highway === 'crossing') return true
@@ -54,8 +84,17 @@ function buildBbox(lat, lng, radiusMeters = 120) {
   }
 }
 
-function buildOverpassQuery(bbox) {
+function buildOverpassQuery(bbox, mode = NETWORK_MODES.CROSSWALK) {
   const bboxStr = `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`
+  if (mode === NETWORK_MODES.PEDESTRIAN_ONLY) {
+    return `[out:json][timeout:25];
+(
+  way["highway"~"^(footway|pedestrian|path|steps|living_street|crossing|residential|unclassified|tertiary|secondary|primary|service|tertiary_link|secondary_link|primary_link)$"](${bboxStr});
+  way["footway"~"^(sidewalk|crossing)$"](${bboxStr});
+);
+out geom;`
+  }
+
   return `[out:json][timeout:25];
 (
   way["highway"~"^(footway|pedestrian|path|steps|living_street|crossing)$"](${bboxStr});
@@ -100,7 +139,7 @@ function projectPointOnSegment(point, start, end) {
   }
 }
 
-function parseOverpassElements(data) {
+function parseOverpassElements(data, mode = NETWORK_MODES.CROSSWALK) {
   const nodes = new Map()
   const ways = []
 
@@ -113,7 +152,7 @@ function parseOverpassElements(data) {
   for (const element of data.elements ?? []) {
     if (element.type === 'way') {
       const tags = element.tags ?? {}
-      if (!isPedestrianWay(tags)) continue
+      if (!isPedestrianWay(tags, mode)) continue
 
       const coordinates =
         element.geometry?.map((coord) => ({ lat: coord.lat, lng: coord.lon })) ??
@@ -124,12 +163,22 @@ function parseOverpassElements(data) {
 
       if (coordinates.length < 2) continue
 
+      const highway = tags.highway
+      const isRoadSurface =
+        mode === NETWORK_MODES.PEDESTRIAN_ONLY &&
+        isRoadHighway(highway) &&
+        tags.footway !== 'sidewalk' &&
+        tags.footway !== 'crossing'
+
       ways.push({
         id: element.id,
         tags,
         coordinates,
-        isCrossing: isCrossing(tags),
-        isPedestrianZone: tags.highway === 'pedestrian' || tags.area === 'yes',
+        isCrossing: mode === NETWORK_MODES.CROSSWALK && isCrossing(tags),
+        isPedestrianZone:
+          mode === NETWORK_MODES.CROSSWALK &&
+          (tags.highway === 'pedestrian' || tags.area === 'yes'),
+        isRoadSurface,
       })
     }
   }
@@ -501,6 +550,7 @@ function waysToGeoJson(ways) {
         crossing: way.tags.crossing,
         isCrossing: way.isCrossing,
         isPedestrianZone: way.isPedestrianZone,
+        isRoadSurface: way.isRoadSurface ?? false,
       },
       geometry: {
         type: 'LineString',
@@ -594,16 +644,26 @@ function prioritizeWaysNearCenter(ways, center, maxWays = 600) {
         const distance = haversineMeters(coord, center)
         return Math.min(best, distance)
       }, Infinity)
-      return { way, minDistance, priority: way.isCrossing ? 0 : way.isPedestrianZone ? 1 : 2 }
+      const priority = way.isRoadSurface
+        ? 0
+        : way.tags?.footway === 'sidewalk'
+          ? 1
+          : way.isCrossing
+            ? 0
+            : way.isPedestrianZone
+              ? 1
+              : 2
+      return { way, minDistance, priority }
     })
     .sort((a, b) => a.priority - b.priority || a.minDistance - b.minDistance)
     .slice(0, maxWays)
     .map((entry) => entry.way)
 }
 
-export async function fetchPedestrianNetwork(center) {
+export async function fetchPedestrianNetwork(center, options = {}) {
+  const mode = options.mode ?? NETWORK_MODES.CROSSWALK
   const bbox = buildBbox(center.lat, center.lng, 110)
-  const query = buildOverpassQuery(bbox)
+  const query = buildOverpassQuery(bbox, mode)
 
   let data = null
   let lastError = null
@@ -626,7 +686,7 @@ export async function fetchPedestrianNetwork(center) {
 
   await new Promise((resolve) => window.setTimeout(resolve, 0))
 
-  const parsed = parseOverpassElements(data)
+  const parsed = parseOverpassElements(data, mode)
   const ways = prioritizeWaysNearCenter(parsed.ways, center)
   const baseGraph = buildPedestrianGraph(ways)
   const edges = bridgeNearbyWayEndpoints(
@@ -638,7 +698,9 @@ export async function fetchPedestrianNetwork(center) {
 
   if (ways.length === 0) {
     throw new Error(
-      'No pedestrian crosswalks or footways found near this intersection in OpenStreetMap.',
+      mode === NETWORK_MODES.PEDESTRIAN_ONLY
+        ? 'No roads or sidewalks found near this intersection in OpenStreetMap.'
+        : 'No pedestrian crosswalks or footways found near this intersection in OpenStreetMap.',
     )
   }
 
@@ -649,6 +711,7 @@ export async function fetchPedestrianNetwork(center) {
     edges,
     nodeIndex,
     geojson: waysToGeoJson(ways),
+    mode,
   }
 }
 

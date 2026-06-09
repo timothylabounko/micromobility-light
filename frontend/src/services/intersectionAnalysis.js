@@ -1,4 +1,9 @@
 import { snapPointToPedestrianNetwork } from './pedestrianOsm.js'
+import {
+  buildIntersectionAreaPolygon,
+  finalizeWalkArea,
+  polygonCenter,
+} from './walkableNetwork.js'
 
 export const INTERSECTION_MODES = {
   CROSSWALK: 'crosswalk',
@@ -76,46 +81,9 @@ function movementLabel(fromApproach, toApproach, turnType) {
   return `${fromApproach.label} → ${toApproach.label} (${turnNames[turnType]})`
 }
 
-export function analyzeIntersection(points, network, options = {}) {
-  const mode = options.mode ?? INTERSECTION_MODES.CROSSWALK
-  const center = points.reduce(
-    (acc, point) => ({
-      lat: acc.lat + point.lat / points.length,
-      lng: acc.lng + point.lng / points.length,
-    }),
-    { lat: 0, lng: 0 },
-  )
-
-  const snappedPoints = points.map((point, index) => {
-    const snap = network?.ways ? requireSnap(point, network, index) : null
-    if (!snap) {
-      throw new Error(
-        `Point ${String.fromCharCode(65 + index)} is too far from a sidewalk or crosswalk. Click closer to the pedestrian network.`,
-      )
-    }
-
-    const bearing = bearingDegrees(center, snap.point)
-    return {
-      id: `approach-${index + 1}`,
-      index,
-      label: String.fromCharCode(65 + index),
-      original: point,
-      snapped: snap.point,
-      snap,
-      snapDistance: snap.distance,
-      bearing,
-      compass: compassLabel(bearing),
-      pedestrianFeature: snap.way?.tags?.highway ?? 'unknown',
-      isCrossing: snap.way?.isCrossing ?? false,
-      isPedestrianZone: snap.way?.isPedestrianZone ?? false,
-    }
-  })
-
-  const countPoints = snappedPoints
-  const approaches = [...snappedPoints].sort((a, b) => a.bearing - b.bearing)
-  const intersectionType = classifyIntersectionType(approaches)
-
+function buildMovementsFromApproaches(approaches) {
   const movements = []
+
   for (const fromApproach of approaches) {
     for (const toApproach of approaches) {
       if (fromApproach.id === toApproach.id) continue
@@ -136,11 +104,125 @@ export function analyzeIntersection(points, network, options = {}) {
     }
   }
 
-  const approachMovements = approaches.map((approach) => ({
+  return movements
+}
+
+function buildApproachMovements(approaches, movements) {
+  return approaches.map((approach) => ({
     approachId: approach.id,
     approachLabel: approach.label,
     movements: movements.filter((movement) => movement.fromApproachId === approach.id),
   }))
+}
+
+function updateCountPointsFromWalkArea(countPoints, walkArea) {
+  const center = walkArea.center ?? polygonCenter(walkArea.coordinates)
+
+  return countPoints.map((countPoint) => {
+    const vertexIndex = walkArea.vertices.findIndex(
+      (vertex) => vertex.type === 'count' && vertex.countPointId === countPoint.id,
+    )
+    if (vertexIndex < 0) return countPoint
+
+    const point = walkArea.coordinates[vertexIndex]
+    const bearing = bearingDegrees(center, point)
+
+    return {
+      ...countPoint,
+      original: point,
+      snapped: point,
+      snap: { point, distance: 0, way: null },
+      bearing,
+      compass: compassLabel(bearing),
+    }
+  })
+}
+
+export function applyWalkAreaEdit(analysis, walkArea) {
+  if (analysis.intersectionMode !== INTERSECTION_MODES.PEDESTRIAN_ONLY || !walkArea) {
+    return analysis
+  }
+
+  const countPoints = updateCountPointsFromWalkArea(analysis.countPoints, walkArea)
+  const center = walkArea.center ?? polygonCenter(walkArea.coordinates)
+  const approaches = [...countPoints].sort((a, b) => a.bearing - b.bearing)
+  const intersectionType = classifyIntersectionType(approaches)
+  const movements = buildMovementsFromApproaches(approaches)
+
+  return {
+    ...analysis,
+    center,
+    countPoints,
+    approaches,
+    movements,
+    approachMovements: buildApproachMovements(approaches, movements),
+    intersectionType,
+    walkArea,
+    hubSnap: { point: center, way: null },
+    hubPoint: center,
+    summary: buildSummary(intersectionType, approaches, movements, analysis.intersectionMode),
+  }
+}
+
+export function analyzeIntersection(points, network, options = {}) {
+  const mode = options.mode ?? INTERSECTION_MODES.CROSSWALK
+  const center = points.reduce(
+    (acc, point) => ({
+      lat: acc.lat + point.lat / points.length,
+      lng: acc.lng + point.lng / points.length,
+    }),
+    { lat: 0, lng: 0 },
+  )
+
+  const snappedPoints = points.map((point, index) => {
+    const snap =
+      mode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+        ? null
+        : network?.ways
+          ? requireSnap(point, network, index)
+          : null
+
+    if (mode !== INTERSECTION_MODES.PEDESTRIAN_ONLY && !snap) {
+      throw new Error(
+        `Point ${String.fromCharCode(65 + index)} is too far from a sidewalk or crosswalk. Click closer to the pedestrian network.`,
+      )
+    }
+
+    const boundaryPoint = mode === INTERSECTION_MODES.PEDESTRIAN_ONLY ? point : snap.point
+    const bearing = bearingDegrees(center, boundaryPoint)
+    return {
+      id: `approach-${index + 1}`,
+      index,
+      label: String.fromCharCode(65 + index),
+      original: point,
+      snapped: boundaryPoint,
+      snap:
+        mode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+          ? { point: boundaryPoint, distance: 0, way: null }
+          : snap,
+      snapDistance: snap?.distance ?? 0,
+      bearing,
+      compass: compassLabel(bearing),
+      pedestrianFeature: snap?.way?.tags?.highway ?? 'boundary',
+      isCrossing: snap?.way?.isCrossing ?? false,
+      isPedestrianZone: snap?.way?.isPedestrianZone ?? false,
+    }
+  })
+
+  const countPoints = snappedPoints
+  const approaches = [...snappedPoints].sort((a, b) => a.bearing - b.bearing)
+  const intersectionType = classifyIntersectionType(approaches)
+
+  const movements = buildMovementsFromApproaches(approaches)
+  const approachMovements = buildApproachMovements(approaches, movements)
+
+  const walkArea =
+    mode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+      ? finalizeWalkArea(
+          buildIntersectionAreaPolygon(snappedPoints.map((point) => point.original)),
+          snappedPoints,
+        )
+      : null
 
   return {
     center,
@@ -150,6 +232,7 @@ export function analyzeIntersection(points, network, options = {}) {
     movements,
     approachMovements,
     intersectionMode: mode,
+    walkArea,
     summary: buildSummary(intersectionType, approaches, movements, mode),
     hubSnap: null,
   }
@@ -271,14 +354,19 @@ export function distributeCountsToMovements(approachCounts, analysis) {
           analysis.countPoints.find((item) => item.id === movement.toApproachId) ??
           analysis.approaches.find((item) => item.id === movement.toApproachId)
 
+        const useBoundaryPoints = analysis.intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
         assignments.push({
           movementId: movement.id,
           movement,
           count,
-          from: countPoint.snapped,
-          to: destination?.snapped,
-          fromSnap: countPoint.snap,
-          toSnap: destination?.snap,
+          from: useBoundaryPoints ? countPoint.original : countPoint.snapped,
+          to: useBoundaryPoints ? destination?.original : destination?.snapped,
+          fromSnap: useBoundaryPoints
+            ? { point: countPoint.original, way: null }
+            : countPoint.snap,
+          toSnap: useBoundaryPoints
+            ? { point: destination?.original, way: null }
+            : destination?.snap,
         })
       }
     })

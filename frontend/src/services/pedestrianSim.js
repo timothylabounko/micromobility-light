@@ -244,17 +244,7 @@ function pathLength(coordinates) {
 
 export function findIntersectionHub(network, center, mode = 'crosswalk') {
   if (mode === 'pedestrian-only') {
-    const zoneWays = network.ways.filter((way) => way.isPedestrianZone)
-    if (zoneWays.length) {
-      const zoneSnap = snapPointToPedestrianNetwork(center, { ways: zoneWays })
-      if (zoneSnap) return zoneSnap
-    }
-
-    const nonCrossingWays = network.ways.filter((way) => !way.isCrossing)
-    const pedSnap = snapPointToPedestrianNetwork(center, {
-      ways: nonCrossingWays.length ? nonCrossingWays : network.ways,
-    })
-    if (pedSnap) return pedSnap
+    return snapPointToPedestrianNetwork(center, network)
   }
 
   const crossingWays = network.ways.filter((way) => way.isCrossing)

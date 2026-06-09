@@ -1,5 +1,6 @@
 import {
   advanceAlongPolyline,
+  buildPedestrianAreaPath,
   buildWalkableIndex,
   lateralSideOf,
 } from './walkableNetwork.js'
@@ -16,7 +17,10 @@ import { buildSimulationTiming } from './simulationTiming.js'
 
 const MIN_BODY_RADIUS = 0.28
 const MAX_LATERAL_SPEED = 1.1
+const MAX_AREA_LATERAL_SPEED = 1.6
 const DISPLAY_SMOOTH_RATE = 8
+const AREA_WANDER_AMPLITUDE = 2.2
+const AREA_AVOIDANCE_STRENGTH = 1.4
 
 // Typical adult walking speeds (~4.6–5.4 km/h)
 export const PEDESTRIAN_SPEED_MIN = 1.28
@@ -94,6 +98,28 @@ function getShortestRoute(network, fromSnap, toSnap, hubSnap, routeCache) {
   return route
 }
 
+function buildAreaIndividualPath(fromPoint, toPoint, walkArea, seed, agentIndex, agentCount) {
+  if (!fromPoint || !toPoint || !walkArea?.coordinates?.length) return null
+
+  const centerPath = buildPedestrianAreaPath(fromPoint, toPoint, walkArea, seed)
+  if (centerPath.length < 2) return null
+
+  const totalLen = pathLength(centerPath)
+  const spawnFraction = agentIndex / Math.max(agentCount, 1)
+  const spawnOffset = spawnFraction * Math.min(totalLen * 0.08, 2.5)
+  const preferredLateral = randomBetween(-2.5, 2.5, seed + 9)
+
+  return {
+    centerPath,
+    pathLength: totalLen,
+    startDistance: spawnOffset,
+    preferredLateral,
+    destination: toPoint,
+    wanderRate: randomBetween(0.35, 0.9, seed + 12),
+    wanderPhase: randomBetween(0, Math.PI * 2, seed + 13),
+  }
+}
+
 function buildIndividualPath(
   network,
   fromSnap,
@@ -105,7 +131,19 @@ function buildIndividualPath(
   agentCount,
   intersectionMode,
   hub,
+  walkArea = null,
 ) {
+  if (intersectionMode === 'pedestrian-only' && walkArea) {
+    return buildAreaIndividualPath(
+      fromSnap?.point ?? fromSnap,
+      toSnap?.point ?? toSnap,
+      walkArea,
+      seed,
+      agentIndex,
+      agentCount,
+    )
+  }
+
   const route = getShortestRoute(network, fromSnap, toSnap, hubSnap, routeCache)
   if (!route?.coordinates?.length) return null
 
@@ -114,12 +152,7 @@ function buildIndividualPath(
   const spawnOffset = randomBetween(0, 4, seed + 1) + spawnFraction * totalLen * 0.1
   const startDistance = Math.min(spawnOffset, totalLen * 0.3)
 
-  const halfWidth =
-    intersectionMode === 'pedestrian-only'
-      ? 4.5
-      : hub?.way?.isCrossing
-        ? 2.5
-        : 1.8
+  const halfWidth = hub?.way?.isCrossing ? 2.5 : 1.8
   const preferredLateral = spreadLateralOffset(agentIndex, agentCount, halfWidth, seed + 9)
 
   return {
@@ -152,11 +185,16 @@ export function buildAgentPopulation(
   intersectionMode = 'crosswalk',
   simulationTiming = buildSimulationTiming(3600),
   crosswalkSignal = null,
+  walkArea = null,
 ) {
-  const hub = resolveSnap(network, hubSnap, hubSnap?.point)
+  const isAreaMode = intersectionMode === 'pedestrian-only' && walkArea?.coordinates?.length >= 3
+  const hub = isAreaMode
+    ? { point: walkArea.center ?? hubSnap?.point }
+    : resolveSnap(network, hubSnap, hubSnap?.point)
+
   if (!hub) return { agents: [], walkable: null }
 
-  const walkable = buildWalkableIndex(network)
+  const walkable = buildWalkableIndex(network, { intersectionMode, walkArea })
   const agents = []
   const routeCache = new Map()
   const movementStats = []
@@ -183,6 +221,7 @@ export function buildAgentPopulation(
         agentCount,
         intersectionMode,
         hub,
+        walkArea,
       )
       seed += 1
 
@@ -211,14 +250,21 @@ export function buildAgentPopulation(
         pathData.preferredLateral,
       )
 
+      const clampedStart = isAreaMode
+        ? walkable.clampToBounds(startPos.point)
+        : startPos.point
+
       const initialState = {
         centerPath: pathData.centerPath,
         pathLength: pathData.pathLength,
         distanceAlong: pathData.startDistance,
         preferredLateral: pathData.preferredLateral,
         lateralOffset: startPos.lateralOffset,
-        position: startPos.point,
-        displayPosition: { ...startPos.point },
+        position: clampedStart,
+        displayPosition: { ...clampedStart },
+        destination: pathData.destination ?? assignment.to,
+        wanderRate: pathData.wanderRate ?? 0.5,
+        wanderPhase: pathData.wanderPhase ?? 0,
         spawnTime,
         state: 'waiting',
         arrived: false,
@@ -371,6 +417,58 @@ function agentNearOthers(agent, agents, elapsedSeconds) {
   })
 }
 
+function pushAgentsApart(a, b, walkable, compressionRatio, useAreaMode) {
+  const dist = haversineMeters(a.position, b.position)
+  const minDist = MIN_BODY_RADIUS * 2 + 0.12
+  if (dist >= minDist || dist < 0.01) return
+
+  const push = (minDist - dist) * 0.55 * compressionRatio
+
+  if (useAreaMode) {
+    const scale = metersPerDegree(a.position.lat)
+    const dx = (b.position.lng - a.position.lng) * scale.lng
+    const dy = (b.position.lat - a.position.lat) * scale.lat
+    const len = Math.hypot(dx, dy) || 1
+    const nx = dx / len
+    const ny = dy / len
+
+    a.position = walkable.clampToBounds({
+      lat: a.position.lat - (ny * push) / scale.lat,
+      lng: a.position.lng - (nx * push) / scale.lng,
+    })
+    b.position = walkable.clampToBounds({
+      lat: b.position.lat + (ny * push * 0.5) / scale.lat,
+      lng: b.position.lng + (nx * push * 0.5) / scale.lng,
+    })
+    return
+  }
+
+  const stepA = advanceAlongPolyline(a.centerPath, a.distanceAlong, 0, walkable)
+  const sideB = lateralSideOf(stepA.centerPoint, stepA.segment, b.position)
+  const dir = sideB === 0 ? (a.lateralOffset >= b.lateralOffset ? 1 : -1) : -sideB
+
+  a.lateralOffset = walkable.clampLateral(
+    a.lateralOffset + dir * push,
+    stepA.segment,
+    stepA.centerPoint,
+  )
+  const placedA = walkable.positionFromCenter(
+    stepA.centerPoint,
+    stepA.segment,
+    a.lateralOffset,
+  )
+  a.position = placedA.point
+
+  const stepB = advanceAlongPolyline(b.centerPath, b.distanceAlong, 0, walkable)
+  const placedB = walkable.positionFromCenter(
+    stepB.centerPoint,
+    stepB.segment,
+    b.lateralOffset - dir * push * 0.5,
+  )
+  b.position = placedB.point
+  b.lateralOffset = placedB.lateralOffset
+}
+
 function resolveOverlaps(agents, walkable, elapsedSeconds, compressionRatio) {
   const active = agents.filter(
     (agent) =>
@@ -378,42 +476,154 @@ function resolveOverlaps(agents, walkable, elapsedSeconds, compressionRatio) {
       !agent.arrived &&
       elapsedSeconds >= agent.spawnTime,
   )
+  const useAreaMode = walkable.useBounds
 
   for (let i = 0; i < active.length; i += 1) {
     for (let j = i + 1; j < active.length; j += 1) {
-      const a = active[i]
-      const b = active[j]
-      const dist = haversineMeters(a.position, b.position)
-      const minDist = MIN_BODY_RADIUS * 2 + 0.12
-
-      if (dist >= minDist || dist < 0.01) continue
-
-      const stepA = advanceAlongPolyline(a.centerPath, a.distanceAlong, 0, walkable)
-      const push = (minDist - dist) * 0.55 * compressionRatio
-      const sideB = lateralSideOf(stepA.centerPoint, stepA.segment, b.position)
-      const dir = sideB === 0 ? (a.lateralOffset >= b.lateralOffset ? 1 : -1) : -sideB
-
-      a.lateralOffset = walkable.clampLateral(
-        a.lateralOffset + dir * push,
-        stepA.segment,
-      )
-      const placedA = walkable.positionFromCenter(
-        stepA.centerPoint,
-        stepA.segment,
-        a.lateralOffset,
-      )
-      a.position = placedA.point
-
-      const stepB = advanceAlongPolyline(b.centerPath, b.distanceAlong, 0, walkable)
-      const placedB = walkable.positionFromCenter(
-        stepB.centerPoint,
-        stepB.segment,
-        b.lateralOffset - dir * push * 0.5,
-      )
-      b.position = placedB.point
-      b.lateralOffset = placedB.lateralOffset
+      pushAgentsApart(active[i], active[j], walkable, compressionRatio, useAreaMode)
     }
   }
+}
+
+function computeAreaAvoidanceOffset(agent, others, elapsedSeconds) {
+  let offsetLat = 0
+  let offsetLng = 0
+  let weightSum = 0
+  const scale = metersPerDegree(agent.position.lat)
+
+  others.forEach((other) => {
+    if (other.id === agent.id) return
+    if (other.state === 'waiting' && elapsedSeconds < other.spawnTime) return
+    if (other.arrived) return
+
+    const dist = haversineMeters(agent.position, other.position)
+    const range = agent.attributes.personalSpace + other.attributes.personalSpace + 0.8
+    if (dist > range * 1.8) return
+
+    const dx = (agent.position.lng - other.position.lng) * scale.lng
+    const dy = (agent.position.lat - other.position.lat) * scale.lat
+    const len = Math.hypot(dx, dy)
+    if (len < 0.05) return
+
+    const strength = Math.max(0, 1 - dist / range) ** 1.4 * AREA_AVOIDANCE_STRENGTH
+    offsetLat += (dy / len) * strength
+    offsetLng += (dx / len) * strength
+    weightSum += strength
+  })
+
+  if (weightSum <= 0) return { lat: 0, lng: 0 }
+  return { lat: offsetLat, lng: offsetLng }
+}
+
+function updateAreaAgent(
+  agent,
+  agents,
+  walkable,
+  elapsedSeconds,
+  deltaSeconds,
+  compressionRatio,
+) {
+  if (agent.arrived) {
+    agent.state = 'arrived'
+    smoothDisplayPosition(
+      agent,
+      agent.position,
+      deltaSeconds,
+      agentNearOthers(agent, agents, elapsedSeconds),
+    )
+    return
+  }
+
+  if (elapsedSeconds < agent.spawnTime) {
+    agent.state = 'waiting'
+    return
+  }
+
+  const simDelta = deltaSeconds * compressionRatio
+  const currentStep = advanceAlongPolyline(
+    agent.centerPath,
+    agent.distanceAlong,
+    0,
+    walkable,
+  )
+
+  const speedFactor = interactionSpeedFactor(
+    agent,
+    agents,
+    currentStep.segment,
+    elapsedSeconds,
+  )
+  const forwardMeters = agent.attributes.speed * speedFactor * simDelta
+
+  agent.wanderPhase += simDelta * agent.wanderRate
+  const wanderOffset =
+    Math.sin(agent.wanderPhase) * AREA_WANDER_AMPLITUDE +
+    Math.sin(agent.wanderPhase * 0.43 + 1.2) * AREA_WANDER_AMPLITUDE * 0.35
+
+  const avoidance = computeAvoidanceLateral(
+    agent,
+    agents,
+    currentStep.centerPoint,
+    currentStep.segment,
+    elapsedSeconds,
+  )
+  const targetLateral = walkable.clampLateral(
+    agent.preferredLateral + wanderOffset + avoidance,
+    currentStep.segment,
+    currentStep.centerPoint,
+  )
+
+  const lateralDiff = targetLateral - agent.lateralOffset
+  const maxLateralStep = MAX_AREA_LATERAL_SPEED * simDelta
+  const lateralStep =
+    Math.sign(lateralDiff) * Math.min(Math.abs(lateralDiff), maxLateralStep)
+  agent.lateralOffset = walkable.clampLateral(
+    agent.lateralOffset + lateralStep,
+    currentStep.segment,
+    currentStep.centerPoint,
+  )
+
+  const step = advanceAlongPolyline(
+    agent.centerPath,
+    agent.distanceAlong,
+    forwardMeters,
+    walkable,
+  )
+
+  let placed = walkable.positionFromCenter(
+    step.centerPoint,
+    step.segment,
+    agent.lateralOffset,
+  )
+
+  const areaAvoidance = computeAreaAvoidanceOffset(agent, agents, elapsedSeconds)
+  const scale = metersPerDegree(placed.point.lat)
+  placed = {
+    point: walkable.clampToBounds({
+      lat: placed.point.lat + areaAvoidance.lat / scale.lat,
+      lng: placed.point.lng + areaAvoidance.lng / scale.lng,
+    }),
+    lateralOffset: agent.lateralOffset,
+    segment: step.segment,
+  }
+
+  agent.distanceAlong = step.distanceAlong
+  agent.position = placed.point
+  agent.state = speedFactor < 0.25 ? 'yielding' : 'walking'
+
+  const destination = agent.destination
+  const distToDestination = destination
+    ? haversineMeters(agent.position, destination)
+    : Infinity
+
+  if (step.arrived || distToDestination < 1.2) {
+    agent.arrived = true
+    agent.position = walkable.clampToBounds(destination ?? placed.point)
+    agent.state = 'arrived'
+  }
+
+  const nearOthers = agentNearOthers(agent, agents, elapsedSeconds)
+  smoothDisplayPosition(agent, agent.position, deltaSeconds, nearOthers)
 }
 
 function updateAgent(
@@ -490,6 +700,7 @@ function updateAgent(
   const targetLateral = walkable.clampLateral(
     agent.preferredLateral + avoidance,
     currentStep.segment,
+    currentStep.centerPoint,
   )
 
   const lateralDiff = targetLateral - agent.lateralOffset
@@ -499,6 +710,7 @@ function updateAgent(
   agent.lateralOffset = walkable.clampLateral(
     agent.lateralOffset + lateralStep,
     currentStep.segment,
+    currentStep.centerPoint,
   )
 
   const step = advanceAlongPolyline(
@@ -547,16 +759,27 @@ export function createAgentSimulation(agentPopulation, simulationTiming, onUpdat
     )
 
     agents.forEach((agent) => {
-      updateAgent(
-        agent,
-        agents,
-        walkable,
-        elapsedDisplaySeconds,
-        deltaSeconds,
-        compressionRatio,
-        crosswalkSignal,
-        intervalSeconds,
-      )
+      if (walkable.useBounds) {
+        updateAreaAgent(
+          agent,
+          agents,
+          walkable,
+          elapsedDisplaySeconds,
+          deltaSeconds,
+          compressionRatio,
+        )
+      } else {
+        updateAgent(
+          agent,
+          agents,
+          walkable,
+          elapsedDisplaySeconds,
+          deltaSeconds,
+          compressionRatio,
+          crosswalkSignal,
+          intervalSeconds,
+        )
+      }
     })
 
     resolveOverlaps(agents, walkable, elapsedDisplaySeconds, compressionRatio)

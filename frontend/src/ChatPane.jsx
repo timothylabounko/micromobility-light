@@ -62,6 +62,7 @@ function ChatPane({
   onCommitPoints,
   onRunSimulation,
   onEditSimulation,
+  onContinueWalkAreaEdit,
   onStartNewSimulation,
   onUndoLastPoint,
   simulationInterval,
@@ -157,6 +158,18 @@ function ChatPane({
           role: 'assistant',
           type: 'text',
           text: `Before entering counts, choose pedestrian signal timing.${pairSummary} Type simultaneous if all crosswalks go green at once (2 min vehicle wait, 30 sec walk per cycle in simulated time), or sequential if one pair goes green then the other (1 min vehicle wait + 30 sec walk per pair).`,
+        },
+      ])
+    }
+
+    if (workflowPhase === 'editing_walk_area') {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          type: 'text',
+          text: 'Adjust the pedestrian walk area on the map. Drag pink corners to move count points, click-drag an edge to widen the area, and double-click an edge to add a corner. Type continue when the area looks right.',
         },
       ])
     }
@@ -374,6 +387,23 @@ function ChatPane({
       return
     }
 
+    if (workflowPhase === 'editing_walk_area') {
+      if (/^(continue|done|next)$/i.test(text)) {
+        onContinueWalkAreaEdit?.()
+        return
+      }
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          type: 'text',
+          text: 'Click-drag edges to widen the walk area, or type continue to enter pedestrian counts.',
+        },
+      ])
+      return
+    }
+
     if (workflowPhase === 'entering_crosswalk_timing') {
       const parsedCrosswalkTiming = parseCrosswalkTimingInput(
         text,
@@ -578,6 +608,8 @@ function ChatPane({
         ? 'Type simultaneous or sequential...'
         : workflowPhase === 'entering_crosswalk_timing'
           ? 'Vehicle/walk intervals or continue...'
+          : workflowPhase === 'editing_walk_area'
+            ? 'Continue when the walk area is ready...'
           : workflowPhase === 'entering_counts'
           ? 'Counts, timing (e.g. 1 hour over 2 min), or run...'
           : workflowPhase === 'picking_points'

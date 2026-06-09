@@ -4,12 +4,14 @@ import 'leaflet/dist/leaflet.css'
 import ChatPane from './ChatPane.jsx'
 import {
   analyzeIntersection,
+  applyWalkAreaEdit,
   attachIntersectionHub,
   distributeCountsToMovements,
   INTERSECTION_MODES,
   MIN_COUNT_POINTS,
   totalApproachCount,
 } from './services/intersectionAnalysis.js'
+import { createWalkAreaEditor } from './services/walkAreaEditor.js'
 import { fetchPedestrianNetwork } from './services/pedestrianOsm.js'
 import {
   buildAgentPopulation,
@@ -17,6 +19,7 @@ import {
   findIntersectionHub,
 } from './services/pedestrianAgents.js'
 import { buildCorridorPolygons } from './services/walkableNetwork.js'
+import { NETWORK_MODES } from './services/pedestrianOsm.js'
 import {
   buildCrosswalkSignalConfig,
   attachCrosswalkPairing,
@@ -44,6 +47,7 @@ function App() {
   const agentLayerRef = useRef(null)
   const routeLayerRef = useRef(null)
   const simControllerRef = useRef(null)
+  const walkAreaEditorRef = useRef(null)
   const simCompleteRef = useRef(false)
   const lastClockUpdateRef = useRef(0)
 
@@ -106,15 +110,31 @@ function App() {
     pedestrianLayerRef.current = L.geoJSON(geojson, {
       renderer: L.canvas({ padding: 0.5 }),
       style: (feature) => ({
-        color: feature.properties.isCrossing ? '#10e0f0' : '#5a8f7b',
-        weight: feature.properties.isCrossing ? 3 : 2,
+        color: feature.properties.isCrossing
+          ? '#10e0f0'
+          : feature.properties.isRoadSurface
+            ? '#8b7355'
+            : '#5a8f7b',
+        weight: feature.properties.isCrossing ? 3 : feature.properties.isRoadSurface ? 3 : 2,
         opacity: feature.properties.isPedestrianZone ? 0.95 : 0.75,
-        dashArray: feature.properties.isCrossing ? null : '4 6',
+        dashArray:
+          feature.properties.isCrossing || feature.properties.isRoadSurface ? null : '4 6',
       }),
     }).addTo(map)
   }, [])
 
-  const renderCountPoints = useCallback((points, intersectionAnalysis = null) => {
+  const isWalkAreaEditorPhase =
+    analysis?.intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY &&
+    analysis?.walkArea?.coordinates?.length >= 3 &&
+    (workflowPhase === 'editing_walk_area' ||
+      workflowPhase === 'entering_counts' ||
+      workflowPhase === 'complete')
+
+  const handleWalkAreaChange = useCallback((walkArea) => {
+    setAnalysis((prev) => (prev ? applyWalkAreaEdit(prev, walkArea) : prev))
+  }, [])
+
+  const renderCountPoints = useCallback((points, intersectionAnalysis = null, hideWalkArea = false) => {
     const layer = pointLayerRef.current
     if (!layer) return
 
@@ -126,11 +146,16 @@ function App() {
       label: String.fromCharCode(65 + index),
     }))
 
+    const useBoundaryPoints =
+      intersectionAnalysis?.intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+
+    if (!hideWalkArea) {
     displayPoints.forEach((entry, index) => {
       const snapped = entry.snapped ?? entry
       const original = entry.original ?? entry
+      const markerPoint = useBoundaryPoints ? original : snapped
 
-      L.circleMarker([snapped.lat, snapped.lng], {
+      L.circleMarker([markerPoint.lat, markerPoint.lng], {
         radius: 8,
         color: '#f13193',
         fillColor: '#f13193',
@@ -146,6 +171,7 @@ function App() {
 
       if (
         intersectionAnalysis &&
+        !useBoundaryPoints &&
         original &&
         (Math.abs(original.lat - snapped.lat) > 0.000001 ||
           Math.abs(original.lng - snapped.lng) > 0.000001)
@@ -159,6 +185,26 @@ function App() {
         ).addTo(layer)
       }
     })
+    }
+
+    if (
+      !hideWalkArea &&
+      intersectionAnalysis?.walkArea?.coordinates?.length >= 3
+    ) {
+      L.polygon(
+        intersectionAnalysis.walkArea.coordinates.map((coord) => [coord.lat, coord.lng]),
+        {
+          color: '#5a8f7b',
+          fillColor: '#5a8f7b',
+          fillOpacity: 0.08,
+          weight: 2,
+          opacity: 0.55,
+          dashArray: '6 4',
+        },
+      )
+        .bindTooltip('Pedestrian walk area', { direction: 'center' })
+        .addTo(layer)
+    }
 
     if (intersectionAnalysis?.hubSnap?.point) {
       const hub = intersectionAnalysis.hubSnap.point
@@ -189,6 +235,8 @@ function App() {
 
   const resetWorkflow = useCallback(() => {
     simControllerRef.current?.stop()
+    walkAreaEditorRef.current?.destroy()
+    walkAreaEditorRef.current = null
     clearAgentLayer()
     setPickedPoints([])
     setIntersectionMode(null)
@@ -222,8 +270,17 @@ function App() {
     setSimulationClock(null)
     simCompleteRef.current = false
     setWorkflowError(null)
+    setWorkflowPhase(
+      analysis?.intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+        ? 'editing_walk_area'
+        : 'entering_counts',
+    )
+  }, [analysis?.intersectionMode, clearAgentLayer])
+
+  const handleContinueWalkAreaEdit = useCallback(() => {
+    setWorkflowError(null)
     setWorkflowPhase('entering_counts')
-  }, [clearAgentLayer])
+  }, [])
 
   const handleStartNewSimulation = useCallback(() => {
     handleStartWorkflow()
@@ -278,21 +335,34 @@ function App() {
         { lat: 0, lng: 0 },
       )
 
-      const network = await fetchPedestrianNetwork(center)
+      const network = await fetchPedestrianNetwork(center, {
+        mode:
+          mode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+            ? NETWORK_MODES.PEDESTRIAN_ONLY
+            : NETWORK_MODES.CROSSWALK,
+      })
 
       await new Promise((resolve) => window.requestAnimationFrame(resolve))
 
-      const hubSnap = findIntersectionHub(network, center, mode)
+      const intersectionAnalysisBase = analyzeIntersection(points, network, { mode })
+      const hubSnap =
+        mode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+          ? {
+              point:
+                intersectionAnalysisBase.walkArea?.center ??
+                intersectionAnalysisBase.center,
+              way: null,
+            }
+          : findIntersectionHub(network, center, mode)
+
       if (!hubSnap) {
-        const hint =
-          mode === INTERSECTION_MODES.PEDESTRIAN_ONLY
-            ? 'Could not find a pedestrian zone or footway at the intersection center. Try crosswalk mode or place points closer to mapped paths.'
-            : 'Could not find a crosswalk or pedestrian path at the intersection center.'
-        throw new Error(hint)
+        throw new Error(
+          'Could not find a crosswalk or pedestrian path at the intersection center.',
+        )
       }
 
       const intersectionAnalysis = attachCrosswalkPairing(
-        attachIntersectionHub(analyzeIntersection(points, network, { mode }), hubSnap),
+        attachIntersectionHub(intersectionAnalysisBase, hubSnap),
       )
 
       setPedestrianNetwork(network)
@@ -305,14 +375,24 @@ function App() {
       setWorkflowPhase(
         mode === INTERSECTION_MODES.CROSSWALK
           ? 'choosing_crosswalk_signal'
-          : 'entering_counts',
+          : 'editing_walk_area',
       )
 
       await new Promise((resolve) => window.requestAnimationFrame(resolve))
 
       renderPedestrianNetwork(network.geojson)
-      renderCountPoints(points, intersectionAnalysis)
-      fitToPoints(intersectionAnalysis.countPoints.map((entry) => entry.snapped))
+      renderCountPoints(
+        points,
+        intersectionAnalysis,
+        intersectionAnalysis.intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY,
+      )
+      fitToPoints(
+        intersectionAnalysis.countPoints.map((entry) =>
+          intersectionAnalysis.intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+            ? entry.original
+            : entry.snapped,
+        ),
+      )
     } catch (error) {
       console.error(error)
       setWorkflowError(
@@ -382,6 +462,43 @@ function App() {
     }
   }, [handleMapClick, workflowPhase])
 
+  useEffect(() => {
+    const map = mapInstanceRef.current
+    if (!map) return undefined
+
+    if (!isWalkAreaEditorPhase || !analysis?.walkArea) {
+      walkAreaEditorRef.current?.destroy()
+      walkAreaEditorRef.current = null
+      return undefined
+    }
+
+    if (!walkAreaEditorRef.current) {
+      walkAreaEditorRef.current = createWalkAreaEditor(map, {
+        walkArea: analysis.walkArea,
+        countPoints: analysis.countPoints ?? [],
+        onChange: handleWalkAreaChange,
+      })
+    }
+
+    renderCountPoints(pickedPoints, analysis, true)
+
+    return undefined
+  }, [
+    analysis,
+    handleWalkAreaChange,
+    isWalkAreaEditorPhase,
+    pickedPoints,
+    renderCountPoints,
+  ])
+
+  useEffect(
+    () => () => {
+      walkAreaEditorRef.current?.destroy()
+      walkAreaEditorRef.current = null
+    },
+    [],
+  )
+
   const movementAssignments = useMemo(() => {
     if (!analysis) return []
     return distributeCountsToMovements(approachCounts, analysis)
@@ -436,7 +553,10 @@ function App() {
     simCompleteRef.current = false
 
     const assignments = movementAssignments
-    const hubSnap = analysis.hubSnap
+    const hubSnap =
+      activeMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+        ? analysis.hubSnap ?? { point: analysis.walkArea?.center ?? analysis.center }
+        : analysis.hubSnap
     if (!hubSnap) {
       return {
         ok: false,
@@ -457,10 +577,13 @@ function App() {
       activeMode,
       simulationInterval,
       crosswalkSignal,
+      analysis.walkArea,
     )
     if (population.agents.length === 0) {
       const message =
-        'No valid pedestrian agents could be created on the walkable network. Try placing count points closer to mapped footways.'
+        activeMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+          ? 'No valid pedestrian agents could be created inside the walk area. Try placing count points closer to mapped roads.'
+          : 'No valid pedestrian agents could be created on the walkable network. Try placing count points closer to mapped footways.'
       setWorkflowError(message)
       return { ok: false, message }
     }
@@ -478,18 +601,34 @@ function App() {
     }
 
     routeLayerRef.current?.clearLayers()
-    buildCorridorPolygons(pedestrianNetwork).forEach((corridor) => {
+    if (
+      activeMode === INTERSECTION_MODES.PEDESTRIAN_ONLY &&
+      analysis.walkArea?.coordinates?.length >= 3
+    ) {
       L.polygon(
-        corridor.coordinates.map((coord) => [coord.lat, coord.lng]),
+        analysis.walkArea.coordinates.map((coord) => [coord.lat, coord.lng]),
         {
-          color: corridor.isCrossing ? '#10e0f0' : '#5a8f7b',
-          fillColor: corridor.isCrossing ? '#10e0f0' : '#5a8f7b',
-          fillOpacity: corridor.isPedestrianZone ? 0.14 : 0.1,
-          weight: 1,
-          opacity: 0.35,
+          color: '#5a8f7b',
+          fillColor: '#5a8f7b',
+          fillOpacity: 0.12,
+          weight: 2,
+          opacity: 0.45,
         },
       ).addTo(routeLayerRef.current)
-    })
+    } else {
+      buildCorridorPolygons(pedestrianNetwork).forEach((corridor) => {
+        L.polygon(
+          corridor.coordinates.map((coord) => [coord.lat, coord.lng]),
+          {
+            color: corridor.isCrossing ? '#10e0f0' : '#5a8f7b',
+            fillColor: corridor.isCrossing ? '#10e0f0' : '#5a8f7b',
+            fillOpacity: corridor.isPedestrianZone ? 0.14 : 0.1,
+            weight: 1,
+            opacity: 0.35,
+          },
+        ).addTo(routeLayerRef.current)
+      })
+    }
 
     const agentMarkers = new Map()
     const markerRadius =
@@ -633,6 +772,7 @@ function App() {
           onCommitPoints={handleCommitPoints}
           onRunSimulation={handleRunSimulation}
           onEditSimulation={handleEditSimulation}
+          onContinueWalkAreaEdit={handleContinueWalkAreaEdit}
           onStartNewSimulation={handleStartNewSimulation}
           onUndoLastPoint={handleUndoLastPoint}
           simulationInterval={simulationInterval}
@@ -667,11 +807,36 @@ function App() {
               <span>Set vehicle and walk intervals in the chat, or type continue for defaults</span>
             </div>
           )}
+          {workflowPhase === 'editing_walk_area' && (
+            <div className="map-hint">
+              <span>
+                Drag pink corners to move count points. Click-drag an edge to widen the area.
+                Double-click an edge to add a point.
+              </span>
+              <div className="map-hint-actions">
+                <button
+                  type="button"
+                  className="map-commit-btn"
+                  onClick={handleContinueWalkAreaEdit}
+                >
+                  Continue to counts
+                </button>
+              </div>
+            </div>
+          )}
+          {workflowPhase === 'entering_counts' &&
+            intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY && (
+            <div className="map-hint map-hint--subtle">
+              <span>
+                Walk area is editable: click-drag edges to widen, double-click to add a point.
+              </span>
+            </div>
+          )}
           {workflowPhase === 'picking_points' && (
             <div className="map-hint">
               <span>
                 {intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
-                  ? 'Pedestrian-only: click count points (min 2)'
+                  ? 'Pedestrian-only: click corners around the intersection (4 recommended, min 2)'
                   : 'Crosswalk: click count points (min 2)'}
                 {pickedPoints.length > 0 ? ` — ${pickedPoints.length} placed` : ''}
               </span>

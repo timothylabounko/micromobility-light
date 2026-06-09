@@ -748,6 +748,61 @@
   pointer-events: auto;
 }
 
+.map-hint--subtle {
+  border-color: #5a8f7b;
+  color: #b8d4c8;
+  font-size: 0.78rem;
+  padding: 0.35rem 0.65rem;
+}
+
+.walk-area-vertex {
+  background: transparent;
+  border: none;
+}
+
+.walk-area-vertex-dot {
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+
+.walk-area-vertex--count .walk-area-vertex-dot {
+  background: #f13193;
+}
+
+.walk-area-vertex--shape .walk-area-vertex-dot {
+  background: #5a8f7b;
+}
+
+.walk-area-vertex-label {
+  position: absolute;
+  top: -18px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 700;
+  color: #f13193;
+  white-space: nowrap;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+  pointer-events: none;
+}
+
+.walk-area-edge-hit {
+  cursor: grab;
+}
+
+.map--edge-dragging,
+.map--edge-dragging .walk-area-edge-hit {
+  cursor: grabbing;
+}
+
+.walk-area-edge-active {
+  pointer-events: none;
+}
+
 .map-hint-actions {
   display: flex;
   align-items: center;
