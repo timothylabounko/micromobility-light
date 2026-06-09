@@ -1,4 +1,7 @@
-const OVERPASS_URLS = ['/api/overpass', '/api/overpass-alt']
+const OVERPASS_URLS = ['/api/overpass-alt', '/api/overpass-fr', '/api/overpass']
+
+const OVERPASS_RETRY_DELAY_MS = 1500
+const OVERPASS_FETCH_TIMEOUT_MS = 35000
 
 const PEDESTRIAN_HIGHWAYS = new Set([
   'footway',
@@ -53,19 +56,12 @@ function buildBbox(lat, lng, radiusMeters = 120) {
 
 function buildOverpassQuery(bbox) {
   const bboxStr = `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`
-  return `[out:json][timeout:90];
+  return `[out:json][timeout:25];
 (
-  way["highway"~"^(footway|pedestrian|path|steps|living_street)$"](${bboxStr});
-  way["highway"="crossing"](${bboxStr});
-  way["footway"="crossing"](${bboxStr});
-  way["highway"="footway"]["footway"="sidewalk"](${bboxStr});
-  way["highway"="footway"]["footway"="crossing"](${bboxStr});
-  node["highway"="crossing"](${bboxStr});
-  way["area"="yes"]["highway"="pedestrian"](${bboxStr});
+  way["highway"~"^(footway|pedestrian|path|steps|living_street|crossing)$"](${bboxStr});
+  way["footway"~"^(sidewalk|crossing)$"](${bboxStr});
 );
-out body geom;
->;
-out skel qt;`
+out geom;`
 }
 
 function haversineMeters(a, b) {
@@ -324,6 +320,149 @@ function reverseEdge(edges, edge) {
   )
 }
 
+function buildAdjacencyList(edges) {
+  const adjacency = new Map()
+
+  edges.forEach((edge) => {
+    if (!adjacency.has(edge.from)) adjacency.set(edge.from, [])
+    adjacency.get(edge.from).push({ to: edge.to, weight: edge.weight, edge })
+  })
+
+  return adjacency
+}
+
+function dijkstraShortestPath(graphNodes, edges, startId, endId) {
+  if (startId == null || endId == null) return null
+  if (startId === endId) return [startId]
+
+  const adjacency = buildAdjacencyList(edges)
+  const distances = new Map([[startId, 0]])
+  const previous = new Map()
+  const queue = [{ nodeId: startId, dist: 0 }]
+
+  while (queue.length > 0) {
+    queue.sort((a, b) => a.dist - b.dist)
+    const { nodeId: current, dist } = queue.shift()
+    if (dist > (distances.get(current) ?? Infinity)) continue
+    if (current === endId) break
+
+    const neighbors = adjacency.get(current) ?? []
+    neighbors.forEach(({ to, weight }) => {
+      const nextDist = dist + weight
+      if (nextDist < (distances.get(to) ?? Infinity)) {
+        distances.set(to, nextDist)
+        previous.set(to, current)
+        queue.push({ nodeId: to, dist: nextDist })
+      }
+    })
+  }
+
+  if (!distances.has(endId)) return null
+
+  const path = [endId]
+  let current = endId
+  while (previous.has(current)) {
+    current = previous.get(current)
+    path.unshift(current)
+  }
+
+  return path
+}
+
+function appendRouteCoordinate(path, coord) {
+  const last = path[path.length - 1]
+  if (!last || haversineMeters(last, coord) > 0.2) {
+    path.push(coord)
+  }
+}
+
+function nodePathToCoordinates(graphNodes, edges, nodeIds, startPoint, endPoint) {
+  if (!nodeIds?.length) return null
+
+  const edgeByPair = new Map()
+  edges.forEach((edge) => {
+    edgeByPair.set(`${edge.from}-${edge.to}`, edge)
+  })
+
+  const path = [startPoint]
+
+  for (let i = 0; i < nodeIds.length - 1; i += 1) {
+    const fromId = nodeIds[i]
+    const toId = nodeIds[i + 1]
+    const edge = edgeByPair.get(`${fromId}-${toId}`)
+
+    if (edge?.coordinates?.length >= 2) {
+      edge.coordinates.forEach((coord) => appendRouteCoordinate(path, coord))
+    } else {
+      appendRouteCoordinate(path, graphNodes[toId])
+    }
+  }
+
+  appendRouteCoordinate(path, endPoint)
+  return path.length >= 2 ? path : null
+}
+
+function bridgeNearbyWayEndpoints(graphNodes, edges, ways, maxBridgeMeters = 18) {
+  const endpointKeys = new Set()
+  ways.forEach((way) => {
+    if (way.coordinates.length < 2) return
+    endpointKeys.add(coordKey(way.coordinates[0]))
+    endpointKeys.add(coordKey(way.coordinates[way.coordinates.length - 1]))
+  })
+
+  const endpointIds = []
+  graphNodes.forEach((node, index) => {
+    if (endpointKeys.has(node.key)) endpointIds.push(index)
+  })
+
+  const bridgeEdges = []
+  for (let i = 0; i < endpointIds.length; i += 1) {
+    for (let j = i + 1; j < endpointIds.length; j += 1) {
+      const fromId = endpointIds[i]
+      const toId = endpointIds[j]
+      const from = graphNodes[fromId]
+      const to = graphNodes[toId]
+      const distance = haversineMeters(from, to)
+      if (distance < 0.5 || distance > maxBridgeMeters) continue
+
+      const bridgeWay = {
+        id: `bridge-${fromId}-${toId}`,
+        isCrossing: false,
+        isPedestrianZone: false,
+      }
+
+      bridgeEdges.push(makeEdge(fromId, toId, from, to, bridgeWay))
+      bridgeEdges.push(makeEdge(toId, fromId, to, from, bridgeWay))
+    }
+  }
+
+  return bridgeEdges.length ? [...edges, ...bridgeEdges] : edges
+}
+
+export function findGraphRoute(network, fromSnap, toSnap) {
+  if (!fromSnap?.point || !toSnap?.point) return null
+
+  const { graphNodes, edges, snapNodeIds } = createRoutableGraph(network, {
+    from: fromSnap,
+    to: toSnap,
+  })
+
+  const startId = snapNodeIds.get('from')
+  const endId = snapNodeIds.get('to')
+  if (startId == null || endId == null) return null
+
+  const nodePath = dijkstraShortestPath(graphNodes, edges, startId, endId)
+  if (!nodePath) return null
+
+  return nodePathToCoordinates(
+    graphNodes,
+    edges,
+    nodePath,
+    fromSnap.point,
+    toSnap.point,
+  )
+}
+
 export function createRoutableGraph(network, snapById) {
   let graphNodes = network.graphNodes.map((node) => ({ ...node }))
   let edges = network.edges.map((edge) => ({ ...edge }))
@@ -371,23 +510,99 @@ function waysToGeoJson(ways) {
   }
 }
 
-async function queryOverpass(query, url) {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `data=${encodeURIComponent(query)}`,
-  })
-
-  const text = await response.text()
-  if (!response.ok || text.includes('runtime error')) {
-    throw new Error(text || 'Overpass request failed')
+function formatOverpassError(text, status) {
+  if (!text) {
+    return `Overpass request failed (${status || 'unknown'}).`
   }
 
-  return JSON.parse(text)
+  if (text.includes('404 Not Found') || text.includes('<title>404 Not Found</title>')) {
+    return 'Overpass API route not found. Restart the Vite dev server (npm run dev) so the /api/overpass proxy is active.'
+  }
+
+  if (status === 504 || text.includes('too busy') || text.includes('timeout')) {
+    return 'Overpass server is busy. Trying another mirror...'
+  }
+
+  const runtimeMatch = text.match(/<strong[^>]*>Error<\/strong>:\s*([^<]+)/i)
+  if (runtimeMatch?.[1]) {
+    return runtimeMatch[1].trim()
+  }
+
+  if (text.trimStart().startsWith('{')) {
+    return 'Overpass returned an unexpected JSON error.'
+  }
+
+  return 'Failed to fetch pedestrian data from OpenStreetMap. Try again in a moment.'
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+async function queryOverpass(query, url, attempt = 1) {
+  const controller = new AbortController()
+  const timeoutId = window.setTimeout(() => controller.abort(), OVERPASS_FETCH_TIMEOUT_MS)
+
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    })
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('Overpass request timed out. Trying another mirror...')
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timeoutId)
+  }
+
+  const text = await response.text()
+  const isBusy =
+    response.status === 504 ||
+    response.status === 429 ||
+    text.includes('too busy') ||
+    text.includes('timeout')
+
+  if ((!response.ok || text.includes('runtime error')) && isBusy && attempt < 2) {
+    await sleep(OVERPASS_RETRY_DELAY_MS)
+    return queryOverpass(query, url, attempt + 1)
+  }
+
+  if (!response.ok || text.includes('runtime error') || text.includes('<strong')) {
+    throw new Error(formatOverpassError(text, response.status))
+  }
+
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(formatOverpassError(text, response.status))
+  }
+}
+
+function prioritizeWaysNearCenter(ways, center, maxWays = 600) {
+  if (ways.length <= maxWays) return ways
+
+  return [...ways]
+    .map((way) => {
+      const minDistance = way.coordinates.reduce((best, coord) => {
+        const distance = haversineMeters(coord, center)
+        return Math.min(best, distance)
+      }, Infinity)
+      return { way, minDistance, priority: way.isCrossing ? 0 : way.isPedestrianZone ? 1 : 2 }
+    })
+    .sort((a, b) => a.priority - b.priority || a.minDistance - b.minDistance)
+    .slice(0, maxWays)
+    .map((entry) => entry.way)
 }
 
 export async function fetchPedestrianNetwork(center) {
-  const bbox = buildBbox(center.lat, center.lng, 140)
+  const bbox = buildBbox(center.lat, center.lng, 110)
   const query = buildOverpassQuery(bbox)
 
   let data = null
@@ -399,6 +614,7 @@ export async function fetchPedestrianNetwork(center) {
       break
     } catch (error) {
       lastError = error
+      await sleep(300)
     }
   }
 
@@ -408,8 +624,17 @@ export async function fetchPedestrianNetwork(center) {
     )
   }
 
-  const { ways } = parseOverpassElements(data)
-  const { graphNodes, edges, nodeIndex } = buildPedestrianGraph(ways)
+  await new Promise((resolve) => window.setTimeout(resolve, 0))
+
+  const parsed = parseOverpassElements(data)
+  const ways = prioritizeWaysNearCenter(parsed.ways, center)
+  const baseGraph = buildPedestrianGraph(ways)
+  const edges = bridgeNearbyWayEndpoints(
+    baseGraph.graphNodes,
+    baseGraph.edges,
+    ways,
+  )
+  const { graphNodes, nodeIndex } = baseGraph
 
   if (ways.length === 0) {
     throw new Error(

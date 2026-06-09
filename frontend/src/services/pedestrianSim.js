@@ -1,5 +1,8 @@
-import { haversineMeters, snapPointToPedestrianNetwork } from './pedestrianOsm.js'
-import { perpendicularOffset } from './walkableNetwork.js'
+import {
+  findGraphRoute,
+  haversineMeters,
+  snapPointToPedestrianNetwork,
+} from './pedestrianOsm.js'
 
 const WALK_SPEED_MPS = 1.4
 const SIM_DURATION_SECONDS = 20
@@ -109,36 +112,47 @@ function buildWayAdjacency(ways) {
   return adjacency
 }
 
-function seededOrder(items, seed) {
-  return [...items].sort((a, b) => {
-    const hashA = Math.sin(seed * 12.9898 + a.wayId * 78.233) * 43758.5453
-    const hashB = Math.sin(seed * 12.9898 + b.wayId * 78.233) * 43758.5453
-    return (hashA - Math.floor(hashA)) - (hashB - Math.floor(hashB))
-  })
+function wayLengthMeters(way) {
+  return pathLength(way.coordinates)
 }
 
-function findWayPath(ways, startWayId, endWayId, seed = 0) {
+function wayLinkCost(fromWay, toWay, link) {
+  return link.distance + wayLengthMeters(fromWay) * 0.35 + wayLengthMeters(toWay) * 0.35
+}
+
+function findShortestWayPath(ways, startWayId, endWayId) {
   if (startWayId === endWayId) return [startWayId]
 
   const adjacency = buildWayAdjacency(ways)
-  const queue = [startWayId]
+  const distances = new Map([[startWayId, 0]])
   const previous = new Map()
-  const visited = new Set([startWayId])
+  const queue = [{ wayId: startWayId, dist: 0 }]
 
   while (queue.length > 0) {
-    const current = queue.shift()
+    queue.sort((a, b) => a.dist - b.dist)
+    const { wayId: current, dist } = queue.shift()
+    if (dist > (distances.get(current) ?? Infinity)) continue
     if (current === endWayId) break
 
-    const neighbors = seededOrder(adjacency.get(current) ?? [], seed + current.length)
+    const currentWay = getWayById(ways, current)
+    if (!currentWay) continue
+
+    const neighbors = adjacency.get(current) ?? []
     neighbors.forEach((neighbor) => {
-      if (visited.has(neighbor.wayId)) return
-      visited.add(neighbor.wayId)
-      previous.set(neighbor.wayId, { wayId: current, link: neighbor.link })
-      queue.push(neighbor.wayId)
+      const nextWay = getWayById(ways, neighbor.wayId)
+      if (!nextWay) return
+
+      const edgeCost = wayLinkCost(currentWay, nextWay, neighbor.link)
+      const newDist = dist + edgeCost
+      if (newDist < (distances.get(neighbor.wayId) ?? Infinity)) {
+        distances.set(neighbor.wayId, newDist)
+        previous.set(neighbor.wayId, { wayId: current, link: neighbor.link })
+        queue.push({ wayId: neighbor.wayId, dist: newDist })
+      }
     })
   }
 
-  if (!visited.has(endWayId)) return null
+  if (!distances.has(endWayId)) return null
 
   const path = [endWayId]
   let current = endWayId
@@ -155,47 +169,14 @@ function getWayById(ways, wayId) {
   return ways.find((way) => way.id === wayId)
 }
 
-function offsetPointAlongWay(way, point, offsetMeters, direction = 1) {
-  const coordinates = way.coordinates
-  const startIdx = closestVertexIndex(coordinates, point)
-  let remaining = Math.abs(offsetMeters)
-  let current = { ...point }
-  const step = direction >= 0 ? 1 : -1
-
-  for (
-    let i = startIdx;
-    remaining > 0 && i >= 0 && i < coordinates.length - 1;
-    i += step
-  ) {
-    const nextIdx = i + step
-    if (nextIdx < 0 || nextIdx >= coordinates.length) break
-
-    const segmentLength = haversineMeters(coordinates[i], coordinates[nextIdx])
-    if (segmentLength <= remaining) {
-      remaining -= segmentLength
-      current = { ...coordinates[nextIdx] }
-      continue
-    }
-
-    const t = remaining / segmentLength
-    current = {
-      lat: coordinates[i].lat + t * (coordinates[nextIdx].lat - coordinates[i].lat),
-      lng: coordinates[i].lng + t * (coordinates[nextIdx].lng - coordinates[i].lng),
-    }
-    remaining = 0
-  }
-
-  return current
-}
-
-function buildRouteOnWays(ways, fromSnap, toSnap, seed = 0) {
+function buildRouteOnWays(ways, fromSnap, toSnap) {
   if (!fromSnap?.way || !toSnap?.way) return null
 
   if (fromSnap.way.id === toSnap.way.id) {
     return walkAlongWay(fromSnap.way, fromSnap.point, toSnap.point)
   }
 
-  const wayIds = findWayPath(ways, fromSnap.way.id, toSnap.way.id, seed)
+  const wayIds = findShortestWayPath(ways, fromSnap.way.id, toSnap.way.id)
   if (!wayIds || wayIds.length === 0) return null
 
   const path = [fromSnap.point]
@@ -261,7 +242,21 @@ function pathLength(coordinates) {
   }, 0)
 }
 
-export function findIntersectionHub(network, center) {
+export function findIntersectionHub(network, center, mode = 'crosswalk') {
+  if (mode === 'pedestrian-only') {
+    const zoneWays = network.ways.filter((way) => way.isPedestrianZone)
+    if (zoneWays.length) {
+      const zoneSnap = snapPointToPedestrianNetwork(center, { ways: zoneWays })
+      if (zoneSnap) return zoneSnap
+    }
+
+    const nonCrossingWays = network.ways.filter((way) => !way.isCrossing)
+    const pedSnap = snapPointToPedestrianNetwork(center, {
+      ways: nonCrossingWays.length ? nonCrossingWays : network.ways,
+    })
+    if (pedSnap) return pedSnap
+  }
+
   const crossingWays = network.ways.filter((way) => way.isCrossing)
   const crossingNetwork = crossingWays.length ? { ways: crossingWays } : network
 
@@ -271,52 +266,53 @@ export function findIntersectionHub(network, center) {
   return snapPointToPedestrianNetwork(center, network)
 }
 
-function offsetHubLaterally(hub, lateralMeters) {
-  if (!lateralMeters || !hub?.way?.coordinates?.length) return hub
+function pickShortestRoute(candidates) {
+  let best = null
+  let bestLength = Infinity
 
-  const coords = hub.way.coordinates
-  const idx = closestVertexIndex(coords, hub.point)
-  const a = coords[Math.max(0, idx - 1)] ?? coords[0]
-  const b = coords[Math.min(coords.length - 1, idx + 1)] ?? coords[coords.length - 1]
+  candidates.forEach((path) => {
+    if (!path || path.length < 2) return
+    const length = pathLength(path)
+    if (length < bestLength) {
+      bestLength = length
+      best = path
+    }
+  })
 
-  return {
-    ...hub,
-    point: perpendicularOffset(hub.point, a, b, lateralMeters),
-  }
+  return best
 }
 
-export function findPedestrianRoute(network, fromSnap, toSnap, hubSnap, options = {}) {
-  const {
-    seed = 0,
-    fromOffsetMeters = 0,
-    toOffsetMeters = 0,
-    hubLateralOffset = 0,
-  } = options
+export function findPedestrianRoute(network, fromSnap, toSnap, hubSnap) {
   const from = resolveSnap(network, fromSnap, fromSnap?.point)
   const to = resolveSnap(network, toSnap, toSnap?.point)
   const hub = resolveSnap(network, hubSnap, hubSnap?.point)
 
-  if (!from || !to || !hub) return null
+  if (!from || !to) return null
 
-  const variedFrom = fromOffsetMeters
-    ? { ...from, point: offsetPointAlongWay(from.way, from.point, fromOffsetMeters, 1) }
-    : from
-  const variedTo = toOffsetMeters
-    ? { ...to, point: offsetPointAlongWay(to.way, to.point, toOffsetMeters, -1) }
-    : to
-  const variedHub = offsetHubLaterally(hub, hubLateralOffset)
+  const candidates = []
 
-  const inbound = buildRouteOnWays(network.ways, variedFrom, variedHub, seed)
-  const outbound = buildRouteOnWays(network.ways, variedHub, variedTo, seed + 7)
+  const graphDirect = findGraphRoute(network, from, to)
+  if (graphDirect) candidates.push(graphDirect)
 
-  let merged = null
-  if (inbound && outbound) {
-    merged = mergeCoordinatePaths([inbound, outbound])
-  } else {
-    merged = buildRouteOnWays(network.ways, from, to)
+  const direct = buildRouteOnWays(network.ways, from, to)
+  if (direct) candidates.push(direct)
+
+  if (hub) {
+    const graphInbound = findGraphRoute(network, from, hub)
+    const graphOutbound = findGraphRoute(network, hub, to)
+    if (graphInbound && graphOutbound) {
+      candidates.push(mergeCoordinatePaths([graphInbound, graphOutbound]))
+    }
+
+    const inbound = buildRouteOnWays(network.ways, from, hub)
+    const outbound = buildRouteOnWays(network.ways, hub, to)
+    if (inbound && outbound) {
+      candidates.push(mergeCoordinatePaths([inbound, outbound]))
+    }
   }
 
-  if (!merged || merged.length < 2) return null
+  const merged = pickShortestRoute(candidates)
+  if (!merged) return null
 
   const coordinates = densifyPath(merged)
 

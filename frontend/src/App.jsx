@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import ChatPane from './ChatPane.jsx'
@@ -6,6 +6,9 @@ import {
   analyzeIntersection,
   attachIntersectionHub,
   distributeCountsToMovements,
+  INTERSECTION_MODES,
+  MIN_COUNT_POINTS,
+  totalApproachCount,
 } from './services/intersectionAnalysis.js'
 import { fetchPedestrianNetwork } from './services/pedestrianOsm.js'
 import {
@@ -14,6 +17,13 @@ import {
   findIntersectionHub,
 } from './services/pedestrianAgents.js'
 import { buildCorridorPolygons } from './services/walkableNetwork.js'
+import {
+  buildCrosswalkSignalConfig,
+  attachCrosswalkPairing,
+  describeCrosswalkSignalMode,
+  getCrosswalkSignalTiming,
+} from './services/crosswalkSignal.js'
+import { describeSimulationTiming } from './services/simulationTiming.js'
 import './App.css'
 
 const MAP_CENTER = [36.7783, -119.4179]
@@ -34,14 +44,21 @@ function App() {
   const agentLayerRef = useRef(null)
   const routeLayerRef = useRef(null)
   const simControllerRef = useRef(null)
+  const simCompleteRef = useRef(false)
+  const lastClockUpdateRef = useRef(0)
 
-  const [workflowPhase, setWorkflowPhase] = useState('picking_points')
+  const [workflowPhase, setWorkflowPhase] = useState('choosing_type')
+  const [intersectionMode, setIntersectionMode] = useState(null)
   const [pickedPoints, setPickedPoints] = useState([])
   const [pedestrianNetwork, setPedestrianNetwork] = useState(null)
   const [analysis, setAnalysis] = useState(null)
-  const [approachCounts, setApproachCounts] = useState([0, 0, 0, 0])
+  const [approachCounts, setApproachCounts] = useState([])
   const [isLoading, setIsLoading] = useState(false)
   const [workflowError, setWorkflowError] = useState(null)
+  const [simulationInterval, setSimulationInterval] = useState(null)
+  const [simulationClock, setSimulationClock] = useState(null)
+  const [crosswalkSignalMode, setCrosswalkSignalMode] = useState(null)
+  const [crosswalkSignalTiming, setCrosswalkSignalTiming] = useState(null)
 
   useEffect(() => {
     if (!mapRef.current || mapInstanceRef.current) return
@@ -87,6 +104,7 @@ function App() {
     }
 
     pedestrianLayerRef.current = L.geoJSON(geojson, {
+      renderer: L.canvas({ padding: 0.5 }),
       style: (feature) => ({
         color: feature.properties.isCrossing ? '#10e0f0' : '#5a8f7b',
         weight: feature.properties.isCrossing ? 3 : 2,
@@ -151,7 +169,12 @@ function App() {
         fillOpacity: 0.9,
         weight: 2,
       })
-        .bindTooltip('Crossing hub', { direction: 'bottom' })
+        .bindTooltip(
+          intersectionAnalysis.intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+            ? 'Intersection hub'
+            : 'Crossing hub',
+          { direction: 'bottom' },
+        )
         .addTo(layer)
     }
   }, [])
@@ -168,10 +191,16 @@ function App() {
     simControllerRef.current?.stop()
     clearAgentLayer()
     setPickedPoints([])
+    setIntersectionMode(null)
     setPedestrianNetwork(null)
     setAnalysis(null)
-    setApproachCounts([0, 0, 0, 0])
+    setApproachCounts([])
     setWorkflowError(null)
+    setSimulationInterval(null)
+    setSimulationClock(null)
+    setCrosswalkSignalMode(null)
+    setCrosswalkSignalTiming(null)
+    simCompleteRef.current = false
     pointLayerRef.current?.clearLayers()
 
     const map = mapInstanceRef.current
@@ -183,11 +212,63 @@ function App() {
 
   const handleStartWorkflow = useCallback(() => {
     resetWorkflow()
-    setWorkflowPhase('picking_points')
+    setWorkflowPhase('choosing_type')
   }, [resetWorkflow])
 
-  const analyzePickedPoints = useCallback(async (points) => {
+  const handleEditSimulation = useCallback(() => {
+    simControllerRef.current?.stop()
+    clearAgentLayer()
+    routeLayerRef.current?.clearLayers()
+    setSimulationClock(null)
+    simCompleteRef.current = false
+    setWorkflowError(null)
+    setWorkflowPhase('entering_counts')
+  }, [clearAgentLayer])
+
+  const handleStartNewSimulation = useCallback(() => {
+    handleStartWorkflow()
+  }, [handleStartWorkflow])
+
+  const handleSelectIntersectionType = useCallback((mode) => {
+    setIntersectionMode(mode)
+    setCrosswalkSignalMode(null)
+    setCrosswalkSignalTiming(null)
+    setWorkflowError(null)
+    setWorkflowPhase('picking_points')
+  }, [])
+
+  const handleSelectCrosswalkSignalMode = useCallback((mode, options = {}) => {
+    setCrosswalkSignalMode(mode)
+    setCrosswalkSignalTiming(getCrosswalkSignalTiming(mode))
+    setWorkflowError(null)
+    setWorkflowPhase(options.skipTimingStep ? 'entering_counts' : 'entering_crosswalk_timing')
+  }, [])
+
+  const handleCrosswalkTimingChange = useCallback((timing) => {
+    setCrosswalkSignalTiming(timing)
+  }, [])
+
+  const handleContinueCrosswalkTiming = useCallback(() => {
+    setWorkflowError(null)
+    setWorkflowPhase('entering_counts')
+  }, [])
+
+  const analyzePickedPoints = useCallback(async (points, mode) => {
+    if (!mode) {
+      setWorkflowError('Choose crosswalk or pedestrian intersection type first.')
+      setWorkflowPhase('choosing_type')
+      return
+    }
+
+    if (points.length < MIN_COUNT_POINTS) {
+      setWorkflowError(`Place at least ${MIN_COUNT_POINTS} count points before committing.`)
+      return
+    }
+
     setIsLoading(true)
+    setWorkflowError(null)
+    await new Promise((resolve) => window.setTimeout(resolve, 0))
+
     try {
       const center = points.reduce(
         (acc, point) => ({
@@ -198,24 +279,40 @@ function App() {
       )
 
       const network = await fetchPedestrianNetwork(center)
-      const hubSnap = findIntersectionHub(network, center)
+
+      await new Promise((resolve) => window.requestAnimationFrame(resolve))
+
+      const hubSnap = findIntersectionHub(network, center, mode)
       if (!hubSnap) {
-        throw new Error(
-          'Could not find a crosswalk or pedestrian path at the intersection center.',
-        )
+        const hint =
+          mode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+            ? 'Could not find a pedestrian zone or footway at the intersection center. Try crosswalk mode or place points closer to mapped paths.'
+            : 'Could not find a crosswalk or pedestrian path at the intersection center.'
+        throw new Error(hint)
       }
 
-      const intersectionAnalysis = attachIntersectionHub(
-        analyzeIntersection(points, network),
-        hubSnap,
+      const intersectionAnalysis = attachCrosswalkPairing(
+        attachIntersectionHub(analyzeIntersection(points, network, { mode }), hubSnap),
       )
 
       setPedestrianNetwork(network)
       setAnalysis(intersectionAnalysis)
+      setApproachCounts(
+        Array.from({ length: intersectionAnalysis.countPoints.length }, () => 0),
+      )
+      setCrosswalkSignalMode(null)
+      setCrosswalkSignalTiming(null)
+      setWorkflowPhase(
+        mode === INTERSECTION_MODES.CROSSWALK
+          ? 'choosing_crosswalk_signal'
+          : 'entering_counts',
+      )
+
+      await new Promise((resolve) => window.requestAnimationFrame(resolve))
+
       renderPedestrianNetwork(network.geojson)
       renderCountPoints(points, intersectionAnalysis)
       fitToPoints(intersectionAnalysis.countPoints.map((entry) => entry.snapped))
-      setWorkflowPhase('entering_counts')
     } catch (error) {
       console.error(error)
       setWorkflowError(
@@ -224,12 +321,20 @@ function App() {
           : 'Failed to load pedestrian network from OpenStreetMap.',
       )
       setWorkflowPhase('picking_points')
-      setPickedPoints([])
-      renderCountPoints([])
+      renderCountPoints(points)
     } finally {
       setIsLoading(false)
     }
   }, [fitToPoints, renderCountPoints, renderPedestrianNetwork])
+
+  const handleCommitPoints = useCallback(() => {
+    if (workflowPhase !== 'picking_points') return
+    if (pickedPoints.length < MIN_COUNT_POINTS) {
+      setWorkflowError(`Place at least ${MIN_COUNT_POINTS} count points before committing.`)
+      return
+    }
+    analyzePickedPoints(pickedPoints, intersectionMode)
+  }, [analyzePickedPoints, intersectionMode, pickedPoints, workflowPhase])
 
   const handleMapClick = useCallback(
     (event) => {
@@ -242,9 +347,7 @@ function App() {
       setPickedPoints(nextPoints)
       renderCountPoints(nextPoints)
 
-      if (nextPoints.length === 4) {
-        analyzePickedPoints(nextPoints)
-      } else if (nextPoints.length === 1) {
+      if (nextPoints.length === 1) {
         const map = mapInstanceRef.current
         map?.setView(event.latlng, Math.max(map.getZoom(), 17))
       }
@@ -279,10 +382,16 @@ function App() {
     }
   }, [handleMapClick, workflowPhase])
 
+  const movementAssignments = useMemo(() => {
+    if (!analysis) return []
+    return distributeCountsToMovements(approachCounts, analysis)
+  }, [analysis, approachCounts])
+
   const handleApproachCountChange = useCallback((index, value) => {
     const parsed = Number.parseInt(value, 10)
     setApproachCounts((prev) => {
       const next = [...prev]
+      while (next.length <= index) next.push(0)
       next[index] = Number.isNaN(parsed) ? 0 : Math.max(0, parsed)
       return next
     })
@@ -292,7 +401,7 @@ function App() {
     if (!analysis || !pedestrianNetwork) {
       return {
         ok: false,
-        message: 'Intersection is not ready yet. Place all four count points first.',
+        message: 'Intersection is not ready yet. Place and commit your count points first.',
       }
     }
 
@@ -304,20 +413,51 @@ function App() {
       }
     }
 
+    if (!simulationInterval) {
+      return {
+        ok: false,
+        message: 'Set the simulation interval first (e.g. type 1 hour in the chat).',
+      }
+    }
+
+    const activeMode = analysis.intersectionMode ?? intersectionMode
+    if (activeMode === INTERSECTION_MODES.CROSSWALK && !crosswalkSignalMode) {
+      return {
+        ok: false,
+        message:
+          'Choose crosswalk signal timing first (type simultaneous or sequential in the chat).',
+      }
+    }
+
     simControllerRef.current?.stop()
     clearAgentLayer()
     setWorkflowError(null)
+    setSimulationClock(null)
+    simCompleteRef.current = false
 
-    const assignments = distributeCountsToMovements(approachCounts, analysis)
+    const assignments = movementAssignments
     const hubSnap = analysis.hubSnap
     if (!hubSnap) {
       return {
         ok: false,
-        message: 'Intersection hub is missing. Place the four points again.',
+        message: 'Intersection hub is missing. Place your points again and commit.',
       }
     }
 
-    const population = buildAgentPopulation(pedestrianNetwork, assignments, hubSnap)
+    const crosswalkSignal = buildCrosswalkSignalConfig(
+      analysis,
+      crosswalkSignalMode,
+      crosswalkSignalTiming,
+    )
+
+    const population = buildAgentPopulation(
+      pedestrianNetwork,
+      assignments,
+      hubSnap,
+      activeMode,
+      simulationInterval,
+      crosswalkSignal,
+    )
     if (population.agents.length === 0) {
       const message =
         'No valid pedestrian agents could be created on the walkable network. Try placing count points closer to mapped footways.'
@@ -352,8 +492,30 @@ function App() {
     })
 
     const agentMarkers = new Map()
+    const markerRadius =
+      population.agents.length > 120 ? 4 : population.agents.length > 60 ? 5 : 7
 
-    simControllerRef.current = createAgentSimulation(population, ({ agentPositions }) => {
+    simControllerRef.current = createAgentSimulation(
+      population,
+      simulationInterval,
+      (clock) => {
+      const { agentPositions } = clock
+      const now = performance.now()
+      if (now - lastClockUpdateRef.current > 200) {
+        lastClockUpdateRef.current = now
+        setSimulationClock(clock)
+      }
+
+      if (
+        !simCompleteRef.current &&
+        clock.elapsedDisplaySeconds >= simulationInterval.displaySeconds
+      ) {
+        simCompleteRef.current = true
+        window.setTimeout(() => {
+          setWorkflowPhase((phase) => (phase === 'running' ? 'complete' : phase))
+        }, 500)
+      }
+
       const layer = agentLayerRef.current
       if (!layer) return
 
@@ -372,14 +534,20 @@ function App() {
 
         if (!marker) {
           marker = L.circleMarker(agent.latlng, {
-            radius: agent.state === 'yielding' ? 5 : 7,
+            radius: agent.state === 'yielding' ? markerRadius - 1 : markerRadius,
             color: '#fff',
             fillColor: color,
-            fillOpacity: agent.state === 'yielding' ? 0.65 : 1,
+            fillOpacity: agent.state === 'yielding' ? 0.85 : 1,
             weight: 2,
           })
+          const stateLabel =
+            agent.state === 'waiting_vehicles'
+              ? 'Waiting for vehicles'
+              : agent.state === 'waiting_signal'
+                ? 'Waiting for walk signal'
+                : agent.state
           marker.bindTooltip(
-            `${agent.fromLabel} → ${agent.toLabel}<br/>Speed: ${agent.speed.toFixed(1)} m/s<br/>Lane offset: ${agent.lateral?.toFixed(1) ?? '0.0'} m<br/>State: ${agent.state}`,
+            `${agent.fromLabel} → ${agent.toLabel}<br/>Speed: ${agent.speed.toFixed(1)} m/s (sim)<br/>Lane: ${agent.lateral?.toFixed(1) ?? '0.0'} m<br/>State: ${stateLabel}`,
             { direction: 'top', opacity: 0.9 },
           )
           marker.addTo(layer)
@@ -387,26 +555,51 @@ function App() {
         } else {
           marker.setLatLng(agent.latlng)
           marker.setStyle({
-            radius: agent.state === 'yielding' ? 5 : 7,
-            fillOpacity: agent.state === 'yielding' ? 0.65 : 1,
+            radius: agent.state === 'yielding' ? markerRadius - 1 : markerRadius,
+            fillOpacity: agent.state === 'yielding' ? 0.85 : 1,
             fillColor: color,
           })
         }
       })
-    })
+    },
+    )
 
     setWorkflowPhase('running')
     simControllerRef.current.start()
 
-    window.setTimeout(() => {
-      setWorkflowPhase((phase) => (phase === 'running' ? 'complete' : phase))
-    }, 25000)
+    const enteredTotal = totalApproachCount(approachCounts)
+    const { requestedTotal, createdTotal, movementStats } = population.stats
+    let countMessage = `Simulating ${createdTotal} pedestrian${createdTotal === 1 ? '' : 's'} from your counts (${enteredTotal} entered across ${analysis.countPoints.length} points).`
+    if (crosswalkSignal?.mode) {
+      countMessage += ` Crosswalk signals: ${describeCrosswalkSignalMode(crosswalkSignal.mode, crosswalkSignal.timing)}.`
+    }
+
+    if (createdTotal < requestedTotal) {
+      const failedMovements = movementStats
+        .filter((entry) => entry.created < entry.requested)
+        .slice(0, 4)
+        .map((entry) => `${entry.label} (${entry.created}/${entry.requested})`)
+      countMessage += ` ${requestedTotal - createdTotal} could not be routed on the walkable network.`
+      if (failedMovements.length > 0) {
+        countMessage += ` Missing routes: ${failedMovements.join('; ')}.`
+      }
+    }
 
     return {
       ok: true,
-      message: `Agent-based simulation started with ${population.agents.length} pedestrians. Shaded areas show walkable bounds; each agent walks its own lane and steers around others.`,
+      message: `${countMessage} ${describeSimulationTiming(simulationInterval)}`,
     }
-  }, [analysis, approachCounts, clearAgentLayer, pedestrianNetwork])
+  }, [
+    analysis,
+    approachCounts,
+    clearAgentLayer,
+    intersectionMode,
+    movementAssignments,
+    crosswalkSignalMode,
+    crosswalkSignalTiming,
+    pedestrianNetwork,
+    simulationInterval,
+  ])
 
   return (
     <div className="page">
@@ -425,30 +618,84 @@ function App() {
           chatEnabled
           workflowPhase={workflowPhase}
           pickedPointCount={pickedPoints.length}
+          intersectionMode={intersectionMode}
           analysis={analysis}
           approachCounts={approachCounts}
+          movementAssignments={movementAssignments}
           onApproachCountChange={handleApproachCountChange}
           onStartWorkflow={handleStartWorkflow}
+          onSelectIntersectionType={handleSelectIntersectionType}
+          onSelectCrosswalkSignalMode={handleSelectCrosswalkSignalMode}
+          crosswalkSignalMode={crosswalkSignalMode}
+          crosswalkSignalTiming={crosswalkSignalTiming}
+          onCrosswalkTimingChange={handleCrosswalkTimingChange}
+          onContinueCrosswalkTiming={handleContinueCrosswalkTiming}
+          onCommitPoints={handleCommitPoints}
           onRunSimulation={handleRunSimulation}
+          onEditSimulation={handleEditSimulation}
+          onStartNewSimulation={handleStartNewSimulation}
           onUndoLastPoint={handleUndoLastPoint}
+          simulationInterval={simulationInterval}
+          simulationClock={simulationClock}
+          onSimulationIntervalChange={setSimulationInterval}
           isLoading={isLoading}
           workflowError={workflowError}
         />
 
         <main className="map-section">
           <div ref={mapRef} className="map" />
+          {isLoading && (
+            <div className="map-loading-overlay" aria-live="polite">
+              <div className="map-loading-card">
+                <span className="map-loading-spinner" aria-hidden="true" />
+                <span>Loading pedestrian network from OpenStreetMap…</span>
+              </div>
+            </div>
+          )}
+          {workflowPhase === 'choosing_type' && (
+            <div className="map-hint">
+              <span>Choose intersection type in the chat: crosswalk or pedestrian</span>
+            </div>
+          )}
+          {workflowPhase === 'choosing_crosswalk_signal' && (
+            <div className="map-hint">
+              <span>Choose crosswalk signal timing in the chat: simultaneous or sequential</span>
+            </div>
+          )}
+          {workflowPhase === 'entering_crosswalk_timing' && (
+            <div className="map-hint">
+              <span>Set vehicle and walk intervals in the chat, or type continue for defaults</span>
+            </div>
+          )}
           {workflowPhase === 'picking_points' && (
             <div className="map-hint">
-              <span>Click 4 pedestrian count points on the intersection</span>
-              {pickedPoints.length > 0 && (
-                <button
-                  type="button"
-                  className="map-undo-btn"
-                  onClick={handleUndoLastPoint}
-                >
-                  Undo last point
-                </button>
-              )}
+              <span>
+                {intersectionMode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+                  ? 'Pedestrian-only: click count points (min 2)'
+                  : 'Crosswalk: click count points (min 2)'}
+                {pickedPoints.length > 0 ? ` — ${pickedPoints.length} placed` : ''}
+              </span>
+              <div className="map-hint-actions">
+                {pickedPoints.length > 0 && (
+                  <button
+                    type="button"
+                    className="map-undo-btn"
+                    onClick={handleUndoLastPoint}
+                  >
+                    Undo last point
+                  </button>
+                )}
+                {pickedPoints.length >= MIN_COUNT_POINTS && (
+                  <button
+                    type="button"
+                    className="map-commit-btn"
+                    onClick={handleCommitPoints}
+                    disabled={isLoading}
+                  >
+                    Done — use {pickedPoints.length} point{pickedPoints.length === 1 ? '' : 's'}
+                  </button>
+                )}
+              </div>
             </div>
           )}
           <div className="map-legend">

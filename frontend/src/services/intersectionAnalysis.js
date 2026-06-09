@@ -1,5 +1,12 @@
 import { snapPointToPedestrianNetwork } from './pedestrianOsm.js'
 
+export const INTERSECTION_MODES = {
+  CROSSWALK: 'crosswalk',
+  PEDESTRIAN_ONLY: 'pedestrian-only',
+}
+
+export const MIN_COUNT_POINTS = 2
+
 function bearingDegrees(from, to) {
   const lat1 = (from.lat * Math.PI) / 180
   const lat2 = (to.lat * Math.PI) / 180
@@ -69,7 +76,8 @@ function movementLabel(fromApproach, toApproach, turnType) {
   return `${fromApproach.label} → ${toApproach.label} (${turnNames[turnType]})`
 }
 
-export function analyzeIntersection(points, network) {
+export function analyzeIntersection(points, network, options = {}) {
+  const mode = options.mode ?? INTERSECTION_MODES.CROSSWALK
   const center = points.reduce(
     (acc, point) => ({
       lat: acc.lat + point.lat / points.length,
@@ -141,7 +149,8 @@ export function analyzeIntersection(points, network) {
     approaches,
     movements,
     approachMovements,
-    summary: buildSummary(intersectionType, approaches, movements),
+    intersectionMode: mode,
+    summary: buildSummary(intersectionType, approaches, movements, mode),
     hubSnap: null,
   }
 }
@@ -158,7 +167,7 @@ function requireSnap(point, network, index) {
   return snapPointToPedestrianNetwork(point, network)
 }
 
-function buildSummary(intersectionType, approaches, movements) {
+function buildSummary(intersectionType, approaches, movements, mode) {
   const typeLabels = {
     'four-way': 'four-way intersection',
     'three-way': 'three-way (T) intersection',
@@ -166,6 +175,11 @@ function buildSummary(intersectionType, approaches, movements) {
     'multi-leg': 'multi-leg intersection',
     unsignalized: 'intersection',
   }
+
+  const modeLabel =
+    mode === INTERSECTION_MODES.PEDESTRIAN_ONLY
+      ? 'pedestrian-only intersection'
+      : 'crosswalk intersection'
 
   const turnCounts = movements.reduce(
     (acc, movement) => {
@@ -177,6 +191,8 @@ function buildSummary(intersectionType, approaches, movements) {
 
   return {
     typeLabel: typeLabels[intersectionType] ?? 'intersection',
+    modeLabel,
+    intersectionMode: mode,
     approachCount: approaches.length,
     movementCount: movements.length,
     turnCounts,
@@ -185,25 +201,55 @@ function buildSummary(intersectionType, approaches, movements) {
   }
 }
 
-export function parseApproachCounts(text, approachCount = 4) {
+export function parseApproachCounts(text, approachCount = MIN_COUNT_POINTS) {
   const numbers = text
     .trim()
     .split(/[\s,]+/)
     .map((value) => Number.parseInt(value, 10))
     .filter((value) => !Number.isNaN(value))
 
-  if (numbers.length !== approachCount) {
+  if (numbers.length !== approachCount || approachCount < MIN_COUNT_POINTS) {
     return null
   }
 
   return numbers
 }
 
+export function totalApproachCount(approachCounts) {
+  return approachCounts.reduce((sum, count) => sum + (count ?? 0), 0)
+}
+
+export function totalMovementCount(assignments) {
+  return assignments.reduce((sum, assignment) => sum + assignment.count, 0)
+}
+
+export function summarizePointFlows(assignments, analysis) {
+  return analysis.countPoints.map((point) => {
+    const departing = assignments
+      .filter((assignment) => assignment.movement.fromApproachId === point.id)
+      .reduce((sum, assignment) => sum + assignment.count, 0)
+    const arriving = assignments
+      .filter((assignment) => assignment.movement.toApproachId === point.id)
+      .reduce((sum, assignment) => sum + assignment.count, 0)
+
+    return {
+      approachId: point.id,
+      label: point.label,
+      compass: point.compass,
+      departing,
+      arriving,
+    }
+  })
+}
+
 export function distributeCountsToMovements(approachCounts, analysis) {
   const assignments = []
 
   analysis.countPoints.forEach((countPoint, index) => {
-    const total = approachCounts[index] ?? 0
+    const total =
+      approachCounts[index] ??
+      approachCounts[analysis.countPoints.indexOf(countPoint)] ??
+      0
     const outgoing = analysis.movements.filter(
       (movement) => movement.fromApproachId === countPoint.id,
     )
