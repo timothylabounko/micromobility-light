@@ -1,0 +1,23 @@
+# Python
+backend/venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Logs
+logs/
+*.log
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
